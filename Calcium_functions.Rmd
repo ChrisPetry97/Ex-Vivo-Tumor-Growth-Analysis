@@ -1,0 +1,1002 @@
+---
+title: "Calcium Functions"
+author: "Christophe Petry"
+date: "2025-06-10"
+output: html_document
+---
+
+
+```{r}
+library(data.table)
+library(plotly)
+library(knitr)
+library(beeswarm)
+library(ggplot2)
+library(ggbeeswarm)
+
+library(dplyr)
+library(stringr)
+
+library(rstatix)
+library(ggpubr)
+
+
+```
+
+
+###########################################################################################################################################
+#                                                                                                                                         #
+#                                                     LOAD FUNCTIONS                                                         #
+#                                                                                                                                         #
+########################################################################################################################################### 
+
+
+# Calcium Imaging Analysis Pipeline Refactored into Functions
+
+```{r}
+# 1. Load and format raw data
+A_load_raw_data <- function(file_path, pattern = "Mean") {
+  raw_data <- read.csv(file_path)
+  column_indices <- grep(pattern, names(raw_data))
+  rawtrace <- raw_data[, column_indices]
+  return(rawtrace)
+}
+
+######################################################
+
+# 2. Prepare metadata and trace structure
+B_prepare_trace_metadata <- function(rawtrace, BG_number, rec_time_min, plot_mode) {
+  cell_number <- ncol(rawtrace) - BG_number
+  rec_time_sec <- rec_time_min * 60
+  frame_rate_Hz <- nrow(rawtrace) / rec_time_sec
+
+  # Rename columns
+  colnames(rawtrace)[1:cell_number] <- paste0("cell_", 1:cell_number)
+  rawtrace$Time <- 1:nrow(rawtrace)
+  rawtrace <- rawtrace[, c(ncol(rawtrace), 1:(ncol(rawtrace) - 1))] # move Time to first col
+
+  sample_of_traces = sample(1:length(rawtrace), 100)
+
+
+  # 3D PLOT to have a initial look at the recorded traces
+  data <- data.table(rawtrace[,sample_of_traces])
+  data[,x := .I]
+  data <- melt(data, id.vars = "x")
+  
+  Plot_rawtrace_3D = plot_ly(data, x = ~x, y = ~variable, z = ~value, type = 'scatter3d', mode = 'lines', color = ~variable)
+  #Plot_rawtrace_3D
+
+  plot_name = paste0(identifier,"_raw_trace_3D.png")
+  
+  handle_plot_output(Plot_rawtrace_3D, mode = plot_mode, result_path = result_path, filename = plot_name)
+
+  list(
+    rawtrace = rawtrace,
+    cell_number = cell_number,
+    rec_time_sec = rec_time_sec,
+    frame_rate_Hz = frame_rate_Hz,
+    time_raw = rawtrace$Time,
+    Plot = Plot_rawtrace_3D
+  
+  )
+}
+
+######################################################
+
+# 3. Plot raw traces in 3D (Optional)
+C_plot_raw_traces_3d <- function(rawtrace, sample_size = 100) {
+  sample_cols <- sample(2:ncol(rawtrace), sample_size)
+  data <- data.table::data.table(rawtrace[, c(1, sample_cols)])
+  data <- melt(data, id.vars = "Time")
+  plotly::plot_ly(data, x = ~Time, y = ~variable, z = ~value, type = 'scatter3d', mode = 'lines', color = ~variable)
+}
+
+######################################################
+
+# 4. Rolling mean baseline correction
+D_baseline_correct_traces <- function(ca_traces, time_raw, window_size = 100) {
+  corrected <- apply(ca_traces, 2, function(trace) {
+    rolling_mean <- zoo::rollmean(trace, k = window_size, align = "center", fill = NA)
+    missing_indices <- which(is.na(rolling_mean))
+    complete_indices <- which(!is.na(rolling_mean))
+
+    if (length(missing_indices) > 0 && length(complete_indices) > 1) {
+      train_df <- data.frame(x = time_raw[complete_indices], y = rolling_mean[complete_indices])
+      lm_model <- lm(y ~ x, data = train_df)
+      pred_df <- data.frame(x = time_raw[missing_indices])
+      rolling_mean[missing_indices] <- predict(lm_model, newdata = pred_df)
+    }
+    trace - rolling_mean
+  })
+  return(as.data.frame(corrected))
+}
+######################################################
+
+
+#5. Classify cells into signaling and non-signaling
+E_classify_cells_by_amplitude <- function(correctedtrace_crop, rawtrace, time_raw, cell_number, window_size = 100, plot_mode = "plot") {
+  max_amplitude <- apply(correctedtrace_crop, 2, max, na.rm = TRUE)
+  mad_val <- mad(max_amplitude)
+  median_val <- median(max_amplitude)
+  cutoff <- median_val + mad_val
+
+  signal_idx <- which(max_amplitude > cutoff)
+  nonsignal_idx <- which(max_amplitude <= cutoff)
+
+  signalling <- correctedtrace_crop[, signal_idx, drop = FALSE]
+  signallingraw <- rawtrace[, signal_idx + 1, drop = FALSE]
+  nonsignalling <- correctedtrace_crop[, nonsignal_idx, drop = FALSE]
+  nonsignallingraw <- rawtrace[, nonsignal_idx + 1, drop = FALSE]
+
+  colors <- rainbow(max(ncol(signalling), ncol(nonsignalling)))
+
+  # Time vector for plotting
+  time_raw <- seq_len(nrow(signalling))
+
+  # Define plot functions for base R plots
+  plot_code_signalling <- function() {
+    plot(time_raw, signalling[, 1], ylim = c(min(signalling), max(signalling)), type = "l", xlab = "Time", ylab = "Ca concentration", col = colors[1], main = "Signaling Cells")
+    for (i in 2:ncol(signalling)) {
+      lines(time_raw, signalling[, i], col = colors[i])
+    }
+  }
+
+  plot_code_nonsignalling <- function() {
+    plot(time_raw, nonsignalling[, 1], ylim = c(min(signalling), max(signalling)), type = "l", xlab = "Time", ylab = "Ca concentration", col = colors[1], main = "Non-Signaling Cells")
+    for (i in 2:ncol(nonsignalling)) {
+      lines(time_raw, nonsignalling[, i], col = colors[i])
+    }
+  }
+
+  # Use updated handle_plot_output()
+  handle_plot_output(plot_code = plot_code_signalling, mode = plot_mode, result_path = result_path, filename = paste0(identifier, "_signalling_plot"))
+  handle_plot_output(plot_code = plot_code_nonsignalling, mode = plot_mode, result_path = result_path, filename = paste0(identifier, "_non_signalling_plot"))
+
+  list(
+    signalling = signalling,
+    signallingraw = signallingraw,
+    nonsignalling = nonsignalling,
+    nonsignallingraw = nonsignallingraw,
+    signal_idx = signal_idx,
+    nonsignal_idx = nonsignal_idx,
+    max_amplitude = max_amplitude,
+    cutoff = cutoff,
+    mad = mad_val,
+    median = median_val
+  )
+}
+
+
+######################################################
+
+# 6. Improved correction for signaling cells
+F_correct_signaling_traces <- function(signallingraw, time_raw, window_filter = 200, window_correction = 200, plot_mode) {
+  if (ncol(signallingraw) == 0 || nrow(signallingraw) == 0) {
+    stop("signallingraw is empty. Ensure at least one signaling cell is detected.")
+  }
+
+  signalling_matrix <- as.matrix(signallingraw)
+
+  rm_for_cutoff <- apply(signalling_matrix, 2, function(trace) {
+    rm <- zoo::rollmean(trace, k = window_filter, align = "center", fill = NA)
+    rm[1:(window_filter / 2)] <- trace[1:(window_filter / 2)]
+    rm[(length(trace) - (window_filter / 2)):length(trace)] <- trace[(length(trace) - (window_filter / 2)):length(trace)]
+    rm
+  })
+
+  raw_cutoff <- matrix(nrow = nrow(signalling_matrix), ncol = ncol(signalling_matrix))
+  for (i in 1:ncol(signalling_matrix)) {
+    raw_cutoff[, i] <- ifelse(signalling_matrix[, i] >= rm_for_cutoff[, i], rm_for_cutoff[, i], signalling_matrix[, i])
+  }
+
+  rm_for_correction <- apply(raw_cutoff, 2, function(trace) {
+    rm <- zoo::rollmean(trace, k = window_correction, align = "center", fill = NA)
+    missing_indices <- which(is.na(rm))
+    complete_indices <- which(!is.na(rm))
+    if (length(missing_indices) > 0 && length(complete_indices) > 1) {
+      train_df <- data.frame(x = time_raw[complete_indices], y = rm[complete_indices])
+      lm_model <- lm(y ~ x, data = train_df)
+      pred_df <- data.frame(x = time_raw[missing_indices])
+      rm[missing_indices] <- predict(lm_model, newdata = pred_df)
+    }
+    rm
+  })
+
+  corrected_signalling <- signalling_matrix - rm_for_correction
+  crop <- window_correction
+  corrected_signalling <- corrected_signalling[crop:(nrow(corrected_signalling) - crop), , drop = FALSE]
+
+  time_raw = seq(1,length(signallingraw[,1]),1)
+  time_corrected = seq(1,length(corrected_signalling[,1]),1)
+  
+  colors <- rainbow(max(ncol(corrected_signalling), ncol(signallingraw)))
+  
+  
+  plot_code_sign_before <- function() {
+    plot(time_raw, signallingraw[, 1], ylim = c(min(signallingraw), max(signallingraw)), type = "l", xlab = "Time", ylab = "Ca concentration", col = colors[1], main = "Signaling Cells   (BEFORE)")
+      for (i in 2:ncol(signallingraw)) {
+        lines(time_raw, signallingraw[, i], col = colors[i])
+      }
+  }
+    
+  
+  
+  plot_code_sign_after <- function() {
+    plot(time_corrected, corrected_signalling[, 1], ylim = c(min(corrected_signalling), max(corrected_signalling)), type = "l", xlab = "Time", ylab = "Ca concentration", col = colors[1], main = "Signaling Cells (AFTER)")
+      for (i in 2:ncol(corrected_signalling)) {
+        lines(time_corrected, corrected_signalling[, i], col = colors[i])
+      }
+  }
+  
+  
+  # Use updated handle_plot_output()
+  handle_plot_output(plot_code = plot_code_sign_before, mode = plot_mode, result_path = result_path, filename = paste0(identifier, "_signalling_before_plot"))
+  handle_plot_output(plot_code = plot_code_sign_after, mode = plot_mode, result_path = result_path, filename = paste0(identifier, "_signalling_after_plot"))
+
+  
+  
+  list(corrected = as.data.frame(corrected_signalling), time = 1:nrow(corrected_signalling))
+}
+
+
+######################################################
+
+
+# 7. Peak detection function
+G_peakdet <- function(v, delta, x = NULL) {
+  if (is.null(x)) x <- seq_along(v)
+  if (length(v) != length(x)) stop("Input vectors v and x must have the same length")
+  if (!is.numeric(delta) || delta <= 0) stop("delta must be a positive numeric value")
+  maxtab <- NULL
+  mintab <- NULL
+  mn <- Inf; mx <- -Inf
+  mnpos <- NA; mxpos <- NA
+  lookformax <- TRUE
+  for (i in seq_along(v)) {
+    this <- v[i]
+    if (this > mx) { mx <- this; mxpos <- x[i] }
+    if (this < mn) { mn <- this; mnpos <- x[i] }
+    if (lookformax && this < mx - delta) {
+      maxtab <- rbind(maxtab, data.frame(pos = mxpos, val = mx))
+      mn <- this; mnpos <- x[i]
+      lookformax <- FALSE
+    } else if (!lookformax && this > mn + delta) {
+      mintab <- rbind(mintab, data.frame(pos = mnpos, val = mn))
+      mx <- this; mxpos <- x[i]
+      lookformax <- TRUE
+    }
+  }
+  list(maxtab = maxtab, mintab = mintab)
+}
+
+
+######################################################
+
+
+# 8. Detect peaks in all cells
+H_detect_peaks_all_cells <- function(final_signalling, time_vector, delta) {
+  peak_matrix_max <- matrix(NA, ncol = ncol(final_signalling), nrow = nrow(final_signalling))
+  peak_matrix_min <- matrix(NA, ncol = ncol(final_signalling), nrow = nrow(final_signalling))
+  peak_times <- list()
+  for (i in seq_len(ncol(final_signalling))) {
+    trace <- final_signalling[[i]]
+    peaks <- G_peakdet(trace, delta, time_vector)
+    for (j in seq_along(peaks$maxtab$pos)) {
+      peak_matrix_max[peaks$maxtab$pos[j], i] <- peaks$maxtab$val[j]
+    }
+    for (j in seq_along(peaks$mintab$pos)) {
+      peak_matrix_min[peaks$mintab$pos[j], i] <- peaks$mintab$val[j]
+    }
+    peak_times[[i]] <- peaks$maxtab$pos
+  }
+  
+  list(peak_matrix_max = peak_matrix_max, peak_matrix_min = peak_matrix_min, peak_times = peak_times)
+}
+
+
+######################################################
+
+
+# 9. Extract peak-centered traces for shape analysis
+I_extract_peak_waveforms <- function(F_final_signalling, peak_times, interval = 200, plot_mode) {
+  before <- interval / 2
+  after <- (interval / 2) - 1
+  
+  max_peaks <- sum(sapply(peak_times, length))  # upper bound for column allocation
+  all_peaks <- matrix(NA, nrow = interval, ncol = max_peaks)
+  index_peak <- 0
+
+  for (i in seq_along(peak_times)) {
+    if (length(peak_times[[i]]) != 0) {
+      time_of_peaks <- peak_times[[i]]
+      start <- time_of_peaks - after
+      stop <- time_of_peaks + before
+      nbr_peaks <- length(time_of_peaks)
+
+      for (j in seq_len(nbr_peaks)) {
+        if (start[j] > 0 && stop[j] <= nrow(F_final_signalling)) {
+          index_peak <- index_peak + 1
+          all_peaks[, index_peak] <- F_final_signalling[start[j]:stop[j], i]
+        }
+      }
+    }
+  }
+
+  all_peaks <- all_peaks[, 1:index_peak, drop = FALSE]
+  all_peaks_df <- as.data.frame(all_peaks)
+
+  # Optional plot
+  
+  plot_code_peaks <- function() {
+    plot(100, 10, xlim = c(80, 120), ylim = range(all_peaks_df, na.rm = TRUE), main = "Aligned Peaks")
+    abline(v = 100)
+    for (i in 1:ncol(all_peaks_df)) {
+      lines(all_peaks_df[, i], type = "l")
+    }
+  }
+  
+  handle_plot_output(plot_code = plot_code_peaks, mode = plot_mode, result_path = result_path, filename = paste0(identifier, "_all_peaks_plot"))
+
+
+  return(all_peaks_df)
+}
+
+######################################################
+
+# 9. Raster plot function
+J_plot_raster <- function(peak_times, final_signalling, plot_mode) {
+  events <- data.frame()
+  for (i in seq_along(peak_times)) {
+    if (length(peak_times[[i]]) > 0) {
+      event_times <- peak_times[[i]]
+      cell_numbers <- rep(i, length(event_times))
+      cell_data <- data.frame(Cell = cell_numbers, Time = event_times)
+      events <- rbind(events, cell_data)
+    }
+  }
+  raster_plot = ggplot(events, aes(x = Time, y = factor(Cell))) +
+    geom_point(shape = 108, size = 2) +
+    labs(x = "Time", y = "Cell") +
+    theme_bw() +
+    ggtitle("Detected peaks in signalling cells")
+  
+    handle_plot_output(raster_plot, mode = plot_mode, result_path = result_path, filename = paste0(identifier, "_raster_plot"))
+
+}
+
+######################################################
+
+# 10. Compute peak-to-peak interval standard deviation
+K_compute_p2p_std <- function(peak_times) {
+  std_devs <- sapply(peak_times, function(times) {
+    if (length(times) >= 4) sd(diff(times)) else NA
+  })
+  return(na.omit(std_devs))
+}
+
+######################################################
+
+
+# 11. Compute firing rate
+L_compute_firing_rate <- function(peak_times, rec_time_min_crop, final_signalling) {
+  firing_rate <- data.frame(cell = colnames(final_signalling), rate = NA)
+  for (i in seq_along(peak_times)) {
+    firing_rate$rate[i] <- length(peak_times[[i]]) / rec_time_min_crop
+  }
+  return(firing_rate)
+}
+
+
+
+######################################################
+
+# 12. Save important variables
+M_save_analysis_results <- function(foldername, identifier) {
+  #filename <- paste0(foldername, identifier, "_CA_RESULTS.RData")
+  all_filename <- paste0(foldername, identifier, "_CA_RESULTS_all.RData")
+  #save(list = variables, file = filename)
+  save.image(all_filename)
+}
+
+
+
+##################################################################################################################################################################
+
+
+## Helper functions
+# To plot or not to plot
+
+
+handle_plot_output <- function(p = NULL, plot_code = NULL, mode = "plot", result_path = NULL, filename = "plot_output", width = 7, height = 5, dpi = 300) {
+  if (mode == "plot") {
+    if (!is.null(p)) {
+      print(p)
+    } else if (!is.null(plot_code)) {
+      plot_code()
+    }
+  } else if (mode == "save") {
+    if (is.null(result_path)) stop("result_path must be provided when mode = 'save'")
+
+    if (!is.null(p) && inherits(p, "ggplot")) {
+      ggsave(filename = file.path(result_path, paste0(filename, ".png")), plot = p, width = width, height = height, dpi = dpi)
+    } else if (!is.null(p) && inherits(p, "plotly")) {
+      htmlwidgets::saveWidget(p, file = file.path(result_path, paste0(filename, ".html")), selfcontained = TRUE)
+    } else if (!is.null(plot_code)) {
+      png(filename = file.path(result_path, paste0(filename, ".png")), width = width, height = height, units = "in", res = dpi)
+      plot_code()
+      dev.off()
+    } else {
+      stop("To save a base R plot, provide either 'p' (ggplot/plotly) or 'plot_code' (function).")
+    }
+  }
+}
+
+```
+
+
+###########################################################################################################################################
+#                                                                                                                                         #
+#                                                     USING FUNCTIONS FOR 1 EXPERIMENT                                                    #
+#                                                                                                                                         #
+###########################################################################################################################################
+
+
+### Test using functions
+```{r}
+# STEP 0: FILL INPUT INFORMATION
+
+# File path for csv file
+file_path <- "/Users/office234/Desktop/All_VJ_Ca/Traces/Results_G04_0_5S_stack.csv"
+
+result_path = "/Users/office234/Desktop/All_VJ_Ca/Results/"   # should end with "/"
+
+#unique identifier for this experiment
+identifier = "G04_0_5S"
+
+# Folder path where files will be saved
+result_path = "/Users/office234/Desktop/All_VJ_Ca/Results/"
+
+# Depending if you want to plot, save the plot or NONE ("plot","save" or "no_plot")
+plot_action = "save"
+
+
+
+
+
+#############################################################
+
+###### Step 1: load data
+A_rawtrace <- A_load_raw_data(file_path, pattern = "Mean")
+
+
+
+
+###### Step 2: Prepare metadata
+B_trace_meta <- B_prepare_trace_metadata(A_rawtrace, BG_number = 0, rec_time_min = 20, plot_mode = "save")
+B_Ca_traces <- meta$rawtrace[, grep("cell_", names(B_trace_meta$rawtrace))]
+
+# Check sample of traces
+C_plot_raw_traces_3d(B_trace_meta$rawtrace,sample_size = 300)
+
+
+
+
+###### Step 3: Baseline correction
+window_size <- 100
+D_corrected <- D_baseline_correct_traces(B_Ca_traces, B_trace_meta$time_raw, window_size)
+crop <- window_size / 2
+D_corrected_crop <- D_corrected[crop:(nrow(D_corrected) - crop), ]
+
+
+
+###### Step 4: Classify cells
+E_signalling_cells <- E_classify_cells_by_amplitude(
+  correctedtrace_crop = D_corrected_crop,
+  rawtrace = B_trace_meta$rawtrace,
+  time_raw = B_trace_meta$time_raw,
+  cell_number = B_trace_meta$cell_number,
+  window_size = window_size,
+  plot_mode = "save"
+)
+
+
+###### Step 5: Improved correction for signaling cells
+window_filter <- 200
+window_correction <- 200
+if (ncol(E_signalling_cells$signallingraw) == 0) stop("No signaling cells detected.")
+F_final_traces <- F_correct_signaling_traces(
+  E_signalling_cells$signallingraw,
+  B_trace_meta$time_raw,
+  window_filter,
+  window_correction,
+  plot_mode = "save"
+)
+F_final_signalling <- F_final_traces$corrected
+time_final <- F_final_traces$time
+
+
+
+###### Step 6: Peak detection
+delta_multiplier <- 2
+std_devs <- apply(F_final_signalling, 2, sd)
+delta <- delta_multiplier * mean(std_devs)
+
+H_peaks <- H_detect_peaks_all_cells(F_final_signalling, time_final, delta)
+
+# Check Peaks
+I_peak_waveforms = I_extract_peak_waveforms(F_final_signalling = F_final_traces$corrected, peak_times = H_peaks$peak_times,interval = 200, plot_mode = "save")
+
+
+
+###### Step 7: Compute metrics
+rec_time_min_crop <- length(time_final) * (B_trace_meta$rec_time_sec / nrow(B_trace_meta$rawtrace)) / 60
+L_firing_rate <- L_compute_firing_rate(H_peaks$peak_times, rec_time_min_crop, F_final_signalling)
+K_p2p <- K_compute_p2p_std(H_peaks$peak_times)
+
+
+
+###### Optional: View raster plot
+J_plot_raster(H_peaks$peak_times, F_final_signalling, plot_mode = "save")
+
+
+
+
+
+
+#### saving
+
+M_save_analysis_results(result_path,identifier = identifier)
+```
+
+
+
+
+###########################################################################################################################################
+#                                                                                                                                         #
+#                                                     LOOP THROUGH A WHOLE FOLDER                                                         #
+#                                                                                                                                         #
+########################################################################################################################################### 
+ 
+ 
+ 
+ 
+#loop through folder
+
+```{r}
+# FOLDER CONTAINING THE csv FILES
+folder = "/Users/office234/Desktop/All_VJ_Ca/Traces"
+
+# FOLDER WHERE YOU WANT TO SAVE STUFF
+result_path = "/Users/office234/Desktop/All_VJ_Ca/Results/"
+
+```
+
+
+```{r}
+
+all_files = list.files(folder)
+
+for (csv in all_files) {
+  
+  file_path <- paste0(folder,"/",csv)
+  
+  naming_info = strsplit(csv,"_")
+  identifier = paste0(naming_info[[1]][2],"_",naming_info[[1]][3],"_",naming_info[[1]][4])
+  
+  # Step 1: load data
+  A_rawtrace <- A_load_raw_data(file_path, pattern = "Mean")
+  
+
+
+  
+  # Step 2: Prepare metadata
+  meta <- B_prepare_trace_metadata(A_rawtrace, BG_number = 0, rec_time_min = 20, plot_mode = "save")
+  B_Ca_traces <- meta$rawtrace[, grep("cell_", names(meta$rawtrace))]
+  
+  #### Check sample of traces
+  C_plot_raw_traces_3d(meta$rawtrace,sample_size = 300)
+  
+  
+  
+  
+  # Step 3: Baseline correction
+  window_size <- 100
+  D_corrected <- D_baseline_correct_traces(B_Ca_traces, meta$time_raw, window_size)
+  crop <- window_size / 2
+  D_corrected_crop <- D_corrected[crop:(nrow(D_corrected) - crop), ]
+  
+  
+  
+  # Step 4: Classify cells
+  E_signalling_cells <- E_classify_cells_by_amplitude(
+    correctedtrace_crop = D_corrected_crop,
+    rawtrace = meta$rawtrace,
+    time_raw = meta$time_raw,
+    cell_number = meta$cell_number,
+    window_size = window_size,
+    plot_mode = "save"
+  )
+  
+  
+  # Step 5: Improved correction for signaling cells
+  window_filter <- 200
+  window_correction <- 200
+  if (ncol(E_signalling_cells$signallingraw) == 0) stop("No signaling cells detected.")
+  F_final_traces <- F_correct_signaling_traces(
+    E_signalling_cells$signallingraw,
+    meta$time_raw,
+    window_filter,
+    window_correction,
+    plot_mode = "save"
+  )
+  F_final_signalling <- F_final_traces$corrected
+  time_final <- F_final_traces$time
+  
+  
+  
+  # Step 6: Peak detection
+  delta_multiplier <- 2
+  std_devs <- apply(F_final_signalling, 2, sd)
+  delta <- delta_multiplier * mean(std_devs)
+  
+  H_peaks <- H_detect_peaks_all_cells(F_final_signalling, time_final, delta)
+  
+  # Check Peaks
+  I_peak_waveforms = I_extract_peak_waveforms(F_final_signalling = F_final_traces$corrected, peak_times = H_peaks$peak_times,interval = 200, plot_mode = "save")
+  
+  
+  
+  # Step 7: Compute metrics
+  rec_time_min_crop <- length(time_final) * (meta$rec_time_sec / nrow(meta$rawtrace)) / 60
+  L_firing_rate <- L_compute_firing_rate(H_peaks$peak_times, rec_time_min_crop, F_final_signalling)
+  K_p2p <- K_compute_p2p_std(H_peaks$peak_times)
+  
+  
+  
+  # Optional: View raster plot
+  J_plot_raster(H_peaks$peak_times, F_final_signalling, plot_mode = "save")
+  
+  
+  
+  
+  
+  
+  #### saving
+  
+  M_save_analysis_results("/Users/office234/Desktop/All_VJ_Ca/Results/",identifier = identifier)
+  
+}
+```
+
+
+
+
+###########################################################################################################################################
+#                                                                                                                                         #
+#                                                     Combine result files                                                                #
+#                                                                                                                                         #
+########################################################################################################################################### 
+ 
+# Manual code
+```{r}
+
+# Define folder and get files
+data_folder <- "/Users/office234/Desktop/All_VJ_Ca/Results/RData files"
+rdata_files <- list.files(data_folder, full.names = TRUE)
+
+# Load and process each file
+all_firing_rates <- lapply(rdata_files, function(file) {
+  filename <- basename(file)
+  condition_id <- str_extract(filename, "^G\\d+")
+  condition_group <- substr(condition_id, 1, 2)  # e.g. "G2" from "G21"
+
+  env <- new.env()
+  load(file, envir = env)
+
+  if (!"L_firing_rate" %in% names(env)) {
+    warning(paste("No L_firing_rate object in", filename))
+    return(NULL)
+  }
+
+  df <- env$L_firing_rate
+  df$Condition <- condition_group
+  df$File <- filename
+  return(df)
+})
+
+# Combine all into one data frame
+firing_rate_all <- bind_rows(all_firing_rates)
+
+# === 🔧 Manual annotation ===
+firing_rate_all$MW <- case_when(
+  firing_rate_all$Condition == "G0" ~ "Stimulation",
+  firing_rate_all$Condition == "G1" ~ "Sham",
+  firing_rate_all$Condition == "G2" ~ "Stimulation",
+  firing_rate_all$Condition == "G3" ~ "Sham",
+  firing_rate_all$Condition == "G4" ~ "Stimulation",
+  firing_rate_all$Condition == "G5" ~ "Sham",
+  firing_rate_all$Condition == "G6" ~ "Stimulation",
+  firing_rate_all$Condition == "G7" ~ "Sham",
+  TRUE ~ "Unknown"
+)
+
+firing_rate_all$Expo_Time <- case_when(
+  firing_rate_all$Condition == "G0" ~ "5",
+  firing_rate_all$Condition == "G1" ~ "5",
+  firing_rate_all$Condition == "G2" ~ "30",
+  firing_rate_all$Condition == "G3" ~ "30",
+  firing_rate_all$Condition == "G4" ~ "5",
+  firing_rate_all$Condition == "G5" ~ "5",
+  firing_rate_all$Condition == "G6" ~ "30",
+  firing_rate_all$Condition == "G7" ~ "30",
+  TRUE ~ NA_character_
+)
+
+firing_rate_all$Recovery_Time <- case_when(
+  firing_rate_all$Condition == "G0" ~ "0",
+  firing_rate_all$Condition == "G1" ~ "0",
+  firing_rate_all$Condition == "G2" ~ "0",
+  firing_rate_all$Condition == "G3" ~ "0",
+  firing_rate_all$Condition == "G4" ~ "24",
+  firing_rate_all$Condition == "G5" ~ "24",
+  firing_rate_all$Condition == "G6" ~ "24",
+  firing_rate_all$Condition == "G7" ~ "24",
+  TRUE ~ NA_character_
+)
+
+# Convert to numeric for plotting
+firing_rate_all$Expo_Time <- as.numeric(firing_rate_all$Expo_Time)
+firing_rate_all$Recovery_Time <- as.numeric(firing_rate_all$Recovery_Time)
+
+
+# Ensure factors are clean
+firing_rate_all$MW <- factor(firing_rate_all$MW, levels = c("Sham", "Stimulation"))
+
+# Filter to comparisons where both MW groups are present
+valid_groups <- firing_rate_all %>%
+  group_by(Recovery_Time, Expo_Time) %>%
+  filter(n_distinct(MW) == 2) %>%
+  ungroup()
+
+
+
+compute_effect_size <- function(wilcox_result, n1, n2) {
+  # Convert Wilcoxon W to Z approximation
+  z <- qnorm(wilcox_result$p.value / 2, lower.tail = FALSE) * sign(wilcox_result$statistic)
+  r <- z / sqrt(n1 + n2)
+  return(r)
+}
+
+test <- wilcox.test(rate ~ MW, data = firing_rate_all)
+effect_size <- compute_effect_size(test, n1 = sum(firing_rate_all$MW == "Sham"), n2 = sum(firing_rate_all$MW == "Stimulation"))
+
+# Wilcoxon test + effect size
+p_values <- valid_groups %>%
+  group_by(Recovery_Time, Expo_Time) %>%
+  wilcox_test(rate ~ MW, paired = FALSE) %>%
+  rstatix::add_effect_size(method = "r") %>%  # Add Cohen's r
+  adjust_pvalue(method = "BH") %>%
+  add_significance() %>%
+  mutate(y.position = max(firing_rate_all$rate, na.rm = TRUE) + 5)
+
+
+ggplot(firing_rate_all, aes(x = MW, y = rate, fill = MW)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.2, fill = "white", outlier.shape = NA) +
+  facet_grid(Recovery_Time ~ Expo_Time) +
+  stat_pvalue_manual(p_values, label = "p.adj.signif", tip.length = 0.01) +
+  labs(title = "Firing Rate by Condition", x = "Condition", y = "Firing Rate (Hz)") +
+  theme_bw()
+
+
+
+
+```
+
+
+
+# function (work in progress)
+```{r}
+extract_metric_from_results <- function(
+  data_folder,
+  metric = c("rate", "p2p", "amplitude", "signal_ratio")
+) {
+  metric <- match.arg(metric)
+
+  files <- list.files(data_folder, pattern = "\\.RData$", full.names = TRUE)
+  results_list <- list()
+
+  for (file in files) {
+    env <- new.env()
+    load(file, envir = env)
+    filename <- basename(file)
+    condition_id <- str_extract(filename, "^G\\d+")
+    condition_group <- substr(condition_id, 1, 2)
+
+    metric_values <- switch(metric,
+      rate = {
+        if (!"L_firing_rate" %in% names(env)) next
+        df <- env$L_firing_rate
+        if (!"rate" %in% names(df)) next
+        df$metric <- df$rate
+        df
+      },
+      p2p = {
+        if (!"K_p2p" %in% names(env)) next
+        data.frame(metric = env$K_p2p)
+      },
+      amplitude = {
+        if (!"E_signalling_cells" %in% names(env)) next
+        amp <- env$E_signalling_cells$max_amplitude
+        data.frame(metric = as.numeric(amp))
+      },
+      signal_ratio = {
+        if (!"E_signalling_cells" %in% names(env) || !"B_Ca_traces" %in% names(env)) next
+        ratio <- 100 * length(env$E_signalling_cells$signal_idx) / ncol(env$B_Ca_traces)
+        data.frame(metric = ratio)
+      }
+    )
+
+    if (is.null(metric_values)) next
+
+    metric_values$Condition <- substr(condition_id, 1, 2)
+    metric_values$File <- filename
+    results_list[[length(results_list) + 1]] <- metric_values
+  }
+
+  df_all <- bind_rows(results_list)
+
+  # Manual annotation
+  df_all$MW <- case_when(
+    df_all$Condition == "G0" ~ "Stimulation",
+    df_all$Condition == "G1" ~ "Sham",
+    df_all$Condition == "G2" ~ "Stimulation",
+    df_all$Condition == "G3" ~ "Sham",
+    df_all$Condition == "G4" ~ "Stimulation",
+    df_all$Condition == "G5" ~ "Sham",
+    df_all$Condition == "G6" ~ "Stimulation",
+    df_all$Condition == "G7" ~ "Sham",
+    TRUE ~ "Unknown"
+  )
+
+  df_all$Expo_Time <- case_when(
+    df_all$Condition == "G0" ~ "5",
+    df_all$Condition == "G1" ~ "5",
+    df_all$Condition == "G2" ~ "30",
+    df_all$Condition == "G3" ~ "30",
+    df_all$Condition == "G4" ~ "5",
+    df_all$Condition == "G5" ~ "5",
+    df_all$Condition == "G6" ~ "30",
+    df_all$Condition == "G7" ~ "30",
+    TRUE ~ NA_character_
+  )
+
+  df_all$Recovery_Time <- case_when(
+    df_all$Condition == "G0" ~ "0",
+    df_all$Condition == "G1" ~ "0",
+    df_all$Condition == "G2" ~ "0",
+    df_all$Condition == "G3" ~ "0",
+    df_all$Condition == "G4" ~ "24",
+    df_all$Condition == "G5" ~ "24",
+    df_all$Condition == "G6" ~ "24",
+    df_all$Condition == "G7" ~ "24",
+    TRUE ~ NA_character_
+  )
+
+  df_all$MW <- factor(df_all$MW, levels = c("Sham", "Stimulation"))
+  df_all$Expo_Time <- as.numeric(df_all$Expo_Time)
+  df_all$Recovery_Time <- as.numeric(df_all$Recovery_Time)
+
+  return(df_all)
+}
+
+```
+
+
+
+```{r}
+df_rate <- extract_metric_from_results(
+  data_folder = "/Users/office234/Desktop/All_VJ_Ca/Results/RData files",
+  metric = "rate"
+)
+
+
+df_p2p <- extract_metric_from_results(
+  data_folder = "/Users/office234/Desktop/All_VJ_Ca/Results/RData files",
+  metric = "p2p"
+)
+
+df_amp <- extract_metric_from_results(
+  data_folder = "/Users/office234/Desktop/All_VJ_Ca/Results/RData files",
+  metric = "amplitude"
+)
+
+df_ratio <- extract_metric_from_results(
+  data_folder = "/Users/office234/Desktop/All_VJ_Ca/Results/RData files",
+  metric = "signal_ratio"
+)
+
+```
+
+
+
+########################### Work in progress
+
+
+```{r}
+# 13. Master pipeline runner
+run_calcium_analysis_pipeline <- function(
+  file_path,
+  identifier,
+  foldername = "./",
+  BG_number = 0,
+  rec_time_min = 20,
+  pattern = "Mean",
+  window_size = 100,
+  window_filter = 200,
+  window_correction = 200,
+  delta_multiplier = 2
+) {
+  # Step 1: Load Data
+  rawtrace <- load_raw_data(file_path, pattern)
+
+  # Step 2: Metadata and Preprocessing
+  meta <- prepare_trace_metadata(rawtrace, BG_number, rec_time_min)
+  ca_traces <- meta$rawtrace[, grep("cell_", names(meta$rawtrace))]
+
+  # Step 3: Baseline Correction
+  corrected <- baseline_correct_traces(ca_traces, meta$time_raw, window_size)
+  crop <- window_size / 2
+  corrected_crop <- corrected[crop:(nrow(corrected) - crop), ]
+
+  # Step 4: Signal Classification
+  classified <- classify_cells_by_amplitude(corrected_crop, meta$rawtrace, meta$time_raw, meta$cell_number, window_size)
+
+  # Step 5: Advanced Correction
+  if (ncol(classified$signallingraw) == 0) {
+    stop("No signaling cells detected. Cannot proceed with advanced correction.")
+  }
+  correction_result <- correct_signaling_traces(classified$signallingraw, meta$time_raw, window_filter, window_correction)
+  final_signalling <- correction_result$corrected
+  time_final <- correction_result$time
+
+  # Step 6: Peak Detection
+  std_devs <- apply(final_signalling, 2, sd)
+  delta <- delta_multiplier * mean(std_devs)
+  peak_results <- detect_peaks_all_cells(final_signalling, time_final, delta)
+
+  # Step 7: Peak Metrics
+  rec_time_min_crop <- length(time_final) * (rec_time_min / nrow(meta$rawtrace))
+  p2p <- compute_p2p_std(peak_results$peak_times)
+  firing_rate <- compute_firing_rate(peak_results$peak_times, rec_time_min_crop, final_signalling)
+
+  # Step 8: Save Results
+  var_names <- c("final_signalling", "classified", "firing_rate", "p2p", "peak_results", "meta")
+  list2env(mget(var_names), envir = .GlobalEnv)
+  save_analysis_results(foldername, identifier, var_names)
+
+  # Return summary output
+  list(
+    final_signalling = final_signalling,
+    firing_rate = firing_rate,
+    p2p = p2p,
+    peak_times = peak_results$peak_times,
+    metadata = meta
+  )
+}
+
+```
+
+
+# Master Function
+```{r}
+results <- run_calcium_analysis_pipeline(
+  file_path = "/Users/office234/Desktop/All_VJ_Ca/Traces/Results_G04_0_5S_stack.csv",
+  identifier = "G04_0_5S",
+  foldername = "/Users/office234/Desktop/All_VJ_Ca/Results/test/",
+  BG_number = 0,
+  rec_time_min = 20
+)
+
+```
+
